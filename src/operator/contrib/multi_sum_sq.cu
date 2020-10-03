@@ -18,10 +18,10 @@
  */
 
 /*!
- *  Copyright (c) 2019 by Contributors
+ *  Copyright (c) 2020 by Contributors
  * \file multi_sum_sq.cu
  * \brief vectorized sums of squares norm over multiple arrays operators
- * \author Clement Fuji Tsang, Andrei Ivanov, Moises Hernandez
+ * \author Clement Fuji Tsang, Andrei Ivanov, Moises Hernandez, Shuai Zheng
  */
 #include "./multi_sum_sq-inl.h"
 #include <cub/cub.cuh>
@@ -37,6 +37,9 @@ namespace op {
 // https://github.com/NVIDIA/apex/blob/master/csrc/multi_tensor_apply.cuh
 // https://github.com/NVIDIA/apex/blob/master/csrc/multi_tensor_l2norm_kernel.cu
 // https://github.com/NVIDIA/apex/blob/master/csrc/type_shim.h
+
+const int chunk_size = 32768;
+
 template <typename DType>
 struct MultiSumSqKernelParam {
   DType* addresses[ARRAY_LIMIT];
@@ -82,7 +85,8 @@ template<typename DType>
 __global__ void MultiSumSqKernel(int chunk_size,
                                  MultiSumSqKernelParam<DType> param,
                                  float* block_reductions,
-                                 int start_tensor_id) {
+                                 int start_tensor_id,
+                                 float scale) {
   const int tensor_loc = param.block_to_tensor[blockIdx.x];
   const int chunk_len = param.block_to_chunk[blockIdx.x] * chunk_size;
   const int n = param.sizes[tensor_loc] - chunk_len;
@@ -98,7 +102,10 @@ __global__ void MultiSumSqKernel(int chunk_size,
     int i = i_start + threadIdx.x;
 #pragma unroll
     for (int ii = 0; ii < ILP && i < i_max; ++ii, i += blockDim.x) {
-      const auto incoming_val = static_cast<float>(x[i]);
+      auto incoming_val = static_cast<float>(x[i]);
+      if (scale != 1.0f) {
+         incoming_val *= scale;
+      }
       val += incoming_val * incoming_val;
     }
   }
@@ -127,9 +134,23 @@ __global__ void GlobalReductionKernel(MultiSumSqKernelParam<DType> param,
 }
 
 template<>
+size_t GetRequiredStorageMultiSumSq<gpu>(const std::vector<TBlob> &inputs,
+                                         int* param_max_chunks_per_tensor) {
+  // find max num of chunks in tensors
+  int max_chunks_per_tensor = -1;
+  for (size_t t = 0; t < inputs.size(); t++) {
+    int chunks_this_tensor = (inputs[t].shape_.Size() + chunk_size - 1) / chunk_size;
+    if (chunks_this_tensor > max_chunks_per_tensor)
+      max_chunks_per_tensor = chunks_this_tensor;
+  }
+  if (param_max_chunks_per_tensor != nullptr)
+    *param_max_chunks_per_tensor = max_chunks_per_tensor;
+  return inputs.size() * max_chunks_per_tensor * sizeof(float);
+}
+
+template<>
 void MultiSumSqRun<gpu>(const std::vector<TBlob> &inputs, int n_inputs,
-                        float *out_ptr, const OpContext &ctx) {
-  const int chunk_size = 32768;
+                        float *out_ptr, const OpContext &ctx, float scale) {
   const int block_size = 512;
   using namespace mxnet_op;
   auto s = ctx.get_stream<gpu>();
@@ -137,14 +158,8 @@ void MultiSumSqRun<gpu>(const std::vector<TBlob> &inputs, int n_inputs,
 
   MSHADOW_REAL_TYPE_SWITCH(inputs[0].type_flag_, DType, {
     MultiSumSqKernelParam<DType> param;
-    // find max num of chunks in tensors
-    for (int t = 0; t < n_inputs; t++) {
-      int chunks_this_tensor = (inputs[t].shape_.Size() + chunk_size - 1) / chunk_size;
-      if (chunks_this_tensor > param.max_chunks_per_tensor)
-        param.max_chunks_per_tensor = chunks_this_tensor;
-    }
-     // temporary storage for the reduction of each block
-    size_t workspace_size = n_inputs * param.max_chunks_per_tensor * sizeof(float);
+    size_t workspace_size = GetRequiredStorageMultiSumSq<gpu>(inputs,
+                                                              &param.max_chunks_per_tensor);
     Tensor<gpu, 1, char> workspace =
       ctx.requested[multi_sum_sq::kTempSpace].get_space_typed<gpu, 1, char>(
         Shape1(workspace_size), s);
@@ -173,7 +188,7 @@ void MultiSumSqRun<gpu>(const std::vector<TBlob> &inputs, int n_inputs,
         if (!(tensors_full || blocks_full || last_chunk))
           continue;
         MultiSumSqKernel<<<loc_block_info, block_size, 0, stream>>>
-          (chunk_size, param, block_reductions.dptr_, start_tensor_id);
+          (chunk_size, param, block_reductions.dptr_, start_tensor_id, scale);
         MSHADOW_CUDA_POST_KERNEL_CHECK(MultiSumSqKernel);
 
         loc_block_info = 0;
